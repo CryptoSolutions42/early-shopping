@@ -5,13 +5,64 @@ import { DexSwap } from '../dex/dex';
 export class PumpManager extends DexSwap {
   private pumpToken: { [key: string]: string }[];
   private subscriptionId: number | undefined;
+  private requestQueue: Array<() => Promise<any>> = [];
+  private isProcessingQueue = false;
+  private readonly rateLimit = 10; // запросов в секунду
+  private readonly connections: Connection[];
+  private currentConnectionIndex = 0;
 
   constructor(
     private connection: Connection,
     private programId: PublicKey,
+    private numberOfConnections = 3, // количество соединений в пуле
   ) {
     super();
     this.pumpToken = [];
+    this.connections = [connection];
+    // Создаем дополнительные соединения
+    for (let i = 1; i < numberOfConnections; i++) {
+      this.connections.push(new Connection(connection.rpcEndpoint));
+      console.log(this.connections);
+    }
+  }
+
+  private getNextConnection(): Connection {
+    this.currentConnectionIndex = (this.currentConnectionIndex + 1) % this.connections.length;
+    return this.connections[this.currentConnectionIndex];
+  }
+
+  private async processQueue() {
+    if (this.isProcessingQueue) return;
+    this.isProcessingQueue = true;
+
+    while (this.requestQueue.length > 0) {
+      const request = this.requestQueue.shift();
+      if (request) {
+        try {
+          await request();
+          // Ждем 1000/rateLimit мс между запросами
+          await new Promise((resolve) => setTimeout(resolve, 1000 / this.rateLimit));
+        } catch (error) {
+          console.error('Error processing request:', error);
+        }
+      }
+    }
+
+    this.isProcessingQueue = false;
+  }
+
+  private async enqueueRequest<T>(request: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      this.requestQueue.push(async () => {
+        try {
+          const result = await request();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      this.processQueue();
+    });
   }
 
   public async watchNewPairs() {
@@ -19,10 +70,10 @@ export class PumpManager extends DexSwap {
       throw new Error('ProgramId is not initialized');
     }
 
-    const version = await this.connection.getVersion();
+    const version = await this.enqueueRequest(() => this.connection.getVersion());
     console.log('Connected to Solana node version:', version);
 
-    this.connection.onLogs(
+    this.subscriptionId = this.connection.onLogs(
       this.programId,
       async (logs) => {
         console.log('search is started => ');
@@ -38,7 +89,7 @@ export class PumpManager extends DexSwap {
           await this.searchPumpAddress(signature);
         }
       },
-      'finalized',
+      'processed',
     );
   }
 
@@ -75,7 +126,7 @@ export class PumpManager extends DexSwap {
                     console.log(`SELL TOKEN ${tokenAddress}`);
                   }
                 },
-                'finalized',
+                'processed',
               );
 
               this.pumpToken.push({ [accountAddress]: tokenAddress });
@@ -97,19 +148,20 @@ export class PumpManager extends DexSwap {
     }
   }
 
-  private async getTransactionWithRetry(signature: string, maxRetries = 5, initialDelay = 500): Promise<any> {
+  private async getTransactionWithRetry(signature: string, maxRetries = 5, initialDelay = 1000): Promise<any> {
+    let lastError;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const tx = await this.connection.getTransaction(signature, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        });
-
-        return tx;
-      } catch (error: unknown) {
-        const { message } = error as { message: string };
-        if (message.includes('429') && attempt < maxRetries) {
-          const delay = initialDelay * attempt;
+        return await this.enqueueRequest(() =>
+          this.getNextConnection().getTransaction(signature, {
+            maxSupportedTransactionVersion: 0,
+            commitment: 'confirmed',
+          }),
+        );
+      } catch (error: any) {
+        lastError = error;
+        if (error.message.includes('429') && attempt < maxRetries) {
+          const delay = initialDelay * Math.pow(2, attempt - 1); // Экспоненциальная задержка
           console.log(`Rate limit hit. Retrying after ${delay}ms... (Attempt ${attempt}/${maxRetries})`);
           await new Promise((resolve) => setTimeout(resolve, delay));
           continue;
@@ -117,8 +169,7 @@ export class PumpManager extends DexSwap {
         throw error;
       }
     }
-
-    throw new Error(`Failed to get transaction after ${maxRetries} retries`);
+    throw lastError;
   }
 
   public async removeSubscription() {
