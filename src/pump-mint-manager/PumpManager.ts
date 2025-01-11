@@ -1,10 +1,21 @@
-import { CompiledInstruction, Connection, PublicKey, TransactionInstruction } from '@solana/web3.js';
+import {
+  CompiledInstruction,
+  Connection,
+  ParsedTransactionWithMeta,
+  PublicKey,
+  TransactionInstruction,
+} from '@solana/web3.js';
 import { bs58 } from '@project-serum/anchor/dist/cjs/utils/bytes';
 import { DexSwap } from '../dex/dex';
 
 export class PumpManager extends DexSwap {
   private pumpToken: { [key: string]: string }[];
-  private subscriptionId: number | undefined;
+
+  private transactionCache = new Map<string, any>();
+  private requestQueue: { signature: string; resolve: Function; reject: Function }[] = [];
+  private isProcessingQueue = false;
+  private lastRequestTime = 0;
+  private readonly REQUEST_DELAY = 1000;
 
   constructor(
     private connection: Connection,
@@ -22,9 +33,9 @@ export class PumpManager extends DexSwap {
     const version = await this.connection.getVersion();
     console.log('Connected to Solana node version:', version);
 
-    this.connection.onLogs(
+    const subscribeIdSearch = this.connection.onLogs(
       this.programId,
-      async (logs) => {
+      async (logs, { slot }) => {
         console.log('search is started => ');
         if (logs.err) return;
 
@@ -35,128 +46,81 @@ export class PumpManager extends DexSwap {
         );
 
         if (isNewToken) {
-          await this.searchPumpAddress(signature);
+          await this.searchPumpAddress(signature, subscribeIdSearch);
         }
       },
       'finalized',
     );
   }
 
-  private async searchPumpAddress(signature: string) {
+  private async searchPumpAddress(signature: string, subscribeIdSearch: number) {
+    await this.removeSubscription(subscribeIdSearch);
     const tx = await this.getTransactionWithRetry(signature);
-
     if (!tx) return;
     if (!tx?.meta) return;
     if (!tx?.meta?.innerInstructions) return;
 
-    const { TOKEN_PROGRAM_ID } = await import('@solana/spl-token');
-    const staticAccountKeys = tx.transaction.message.staticAccountKeys;
+    instructionLoop: for (const instruction of tx.meta.innerInstructions[0].instructions) {
+      if ('parsed' in instruction) {
+        if ('info' in instruction.parsed) {
+          if ('mint' in instruction.parsed.info && 'wallet' in instruction.parsed.info) {
+            let isSell = false;
+            const tokenAddress = instruction.parsed.info.mint;
+            const accountAddress = instruction.parsed.info.wallet;
+            console.log(`tokenAddress => ${tokenAddress}`);
+            console.log(`accountAddress => ${accountAddress}`);
 
-    instructionLoop: for (const item of tx.meta.innerInstructions) {
-      for (const instruction of item.instructions) {
-        if (staticAccountKeys[instruction.programIdIndex].equals(TOKEN_PROGRAM_ID)) {
-          const transactionInstruction = this.compiledInstructionToTransaction(instruction, staticAccountKeys);
-
-          try {
-            const tokenAddressPubKey = transactionInstruction.keys[0].pubkey;
-            const tokenAddress = tokenAddressPubKey.toBase58();
-            const accountAddress = this.isNotPumpAddress(tokenAddress);
-            if (this.isPumpAddress(tokenAddress) && accountAddress) {
+            try {
+              this.pumpToken.push({ [accountAddress]: tokenAddress });
               console.log(`BUY TOKEN ${tokenAddress}`);
-              this.connection.onLogs(
+
+              const subscribeIdSell = this.connection.onLogs(
                 new PublicKey(accountAddress),
                 async (logs) => {
                   console.log('sell watcher listen => ');
                   if (logs.err) return;
-
                   const isSellOperation = logs.logs.some((log) => log === 'Program log: Instruction: Sell');
 
                   if (isSellOperation) {
                     console.log(`SELL TOKEN ${tokenAddress}`);
+                    this.pumpToken.forEach(async (token, index) => {
+                      if (token[accountAddress]) {
+                        this.pumpToken.slice(index, 1);
+                        console.log('deleted token');
+                      }
+                    });
+                    isSell = true;
+                    if (isSell) {
+                      await this.removeSubscription(subscribeIdSell);
+                      console.log('Token Address:', this.pumpToken);
+                    }
                   }
                 },
-                'finalized',
+                'confirmed',
               );
 
-              this.pumpToken.push({ [accountAddress]: tokenAddress });
-
-              console.log('Token Address:', this.pumpToken);
               break instructionLoop;
+            } catch (error) {
+              console.error('Failed process: ', error);
+              await this.sleep(100);
             }
-          } catch (error) {
-            console.error('Failed to decode instruction:', error);
-            console.log('Instruction data:', transactionInstruction.data);
-            console.log('Program ID:', transactionInstruction.programId.toBase58());
-            console.log(
-              'Keys:',
-              transactionInstruction.keys.map((k) => k.pubkey.toBase58()),
-            );
           }
         }
       }
     }
   }
 
-  private async getTransactionWithRetry(signature: string, maxRetries = 5, initialDelay = 500): Promise<any> {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const tx = await this.connection.getTransaction(signature, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        });
-
-        return tx;
-      } catch (error: unknown) {
-        const { message } = error as { message: string };
-        if (message.includes('429') && attempt < maxRetries) {
-          const delay = initialDelay * attempt;
-          console.log(`Rate limit hit. Retrying after ${delay}ms... (Attempt ${attempt}/${maxRetries})`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          continue;
-        }
-        throw error;
-      }
+  private async removeSubscription(subscribeId: number) {
+    if (subscribeId) {
+      return;
     }
 
-    throw new Error(`Failed to get transaction after ${maxRetries} retries`);
-  }
-
-  public async removeSubscription() {
-    if (this.subscriptionId) {
-      try {
-        await this.connection.removeOnLogsListener(this.subscriptionId);
-        console.log('Subscription removed:', this.subscriptionId);
-        this.subscriptionId = undefined;
-      } catch (error) {
-        console.error('Error removing subscription:', error);
-      }
+    try {
+      await this.connection.removeOnLogsListener(subscribeId);
+      console.log('Subscription removed:', subscribeId);
+    } catch (error) {
+      console.error('Error removing subscription:', error);
     }
-  }
-
-  private isNotPumpAddress(pubkey: string): string | void {
-    if (!this.isPumpAddress(pubkey)) {
-      return pubkey;
-    }
-  }
-
-  private isPumpAddress(pubkey: string): boolean {
-    const normalizedAddress = pubkey.toLowerCase();
-    return normalizedAddress.endsWith('pump');
-  }
-
-  private compiledInstructionToTransaction(
-    instruction: CompiledInstruction,
-    staticAccountKeys: PublicKey[],
-  ): TransactionInstruction {
-    return {
-      programId: staticAccountKeys[instruction.programIdIndex],
-      keys: instruction.accounts.map((index) => ({
-        pubkey: staticAccountKeys[index],
-        isSigner: false,
-        isWritable: false,
-      })),
-      data: Buffer.from(instruction.data, 'base64'),
-    };
   }
 
   private async checkLiquidity(poolAddress: string): Promise<{ isEnough: boolean; amount: number }> {
@@ -174,5 +138,75 @@ export class PumpManager extends DexSwap {
       console.error('Error checking liquidity:', error);
       return { isEnough: false, amount: 0 };
     }
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async processQueue() {
+    if (this.isProcessingQueue) return;
+    this.isProcessingQueue = true;
+
+    while (this.requestQueue.length > 0) {
+      const request = this.requestQueue[0];
+      const now = Date.now();
+      const timeSinceLastRequest = now - this.lastRequestTime;
+
+      if (timeSinceLastRequest < this.REQUEST_DELAY) {
+        await this.sleep(this.REQUEST_DELAY - timeSinceLastRequest);
+      }
+
+      try {
+        const tx = await this.connection.getParsedTransaction(request.signature, {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'finalized',
+        });
+
+        if (tx) {
+          this.transactionCache.set(request.signature, tx);
+        }
+
+        request.resolve(tx);
+      } catch (error: unknown) {
+        const { message } = error as { message: string };
+        if (message.includes('429')) {
+          await this.sleep(this.REQUEST_DELAY);
+          continue;
+        }
+        request.reject(error);
+      }
+
+      this.requestQueue.shift();
+      this.lastRequestTime = Date.now();
+    }
+
+    this.isProcessingQueue = false;
+  }
+
+  private async getTransaction(signature: string) {
+    try {
+      const tx = await this.connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'finalized',
+      });
+
+      return tx;
+    } catch (error: unknown) {
+      const { message } = error as { message: string };
+      return;
+    }
+  }
+
+  private async getTransactionWithRetry(signature: string): Promise<ParsedTransactionWithMeta> {
+    // Проверяем кэш
+    if (this.transactionCache.has(signature)) {
+      return this.transactionCache.get(signature);
+    }
+
+    return new Promise((resolve, reject) => {
+      this.requestQueue.push({ signature, resolve, reject });
+      this.processQueue();
+    });
   }
 }
